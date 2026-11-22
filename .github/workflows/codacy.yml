@@ -54,7 +54,111 @@ jobs:
           # This will handover control about PR rejection to the GitHub side
           max-allowed-issues: 2147483647
 
-      # Upload the SARIF file generated in the previous step
+      # CodeQL requires no more than one SARIF run per category. Merge duplicate
+      # runs from the same analyzer and deduplicate identical findings first.
+      - name: Merge duplicate SARIF runs
+        run: |
+          python3 - <<'PY'
+          import copy
+          import json
+          from pathlib import Path
+
+          path = Path("results.sarif")
+          sarif = json.loads(path.read_text())
+          runs = sarif.get("runs", [])
+
+          def canonical(value):
+              return json.dumps(value, sort_keys=True, separators=(",", ":"))
+
+          # SARIF category is the automationDetails.id. Keep analyzers separate
+          # when Codacy reuses a category across different tool drivers.
+          categories = {}
+          for run in runs:
+              driver = run.get("tool", {}).get("driver", {})
+              driver_name = driver.get("name", "unknown")
+              category = run.get("automationDetails", {}).get("id") or driver_name
+              categories.setdefault(category, set()).add(driver_name)
+
+          merged = {}
+          for run in runs:
+              driver = run.get("tool", {}).get("driver", {})
+              driver_name = driver.get("name", "unknown")
+              category = run.get("automationDetails", {}).get("id") or driver_name
+              if len(categories[category]) > 1:
+                  category = f"{category}/{driver_name}"
+              key = (category, driver_name)
+
+              if key not in merged:
+                  target = copy.deepcopy(run)
+                  target.setdefault("automationDetails", {})["id"] = category
+                  target_driver = target.setdefault("tool", {}).setdefault("driver", {})
+                  target_driver.setdefault("rules", [])
+                  target["artifacts"] = target.get("artifacts", [])
+                  target["results"] = []
+                  target["_rule_map"] = {}
+                  target["_artifact_map"] = {}
+                  target["_result_set"] = set()
+                  merged[key] = target
+              target = merged[key]
+              target_driver = target["tool"]["driver"]
+
+              # Merge rule metadata and remember the destination index so
+              # result.ruleIndex continues to reference the correct rule.
+              rule_lookup = {canonical(rule): i for i, rule in enumerate(target_driver["rules"])}
+              source_rules = driver.get("rules", [])
+              rule_map = {}
+              for index, rule in enumerate(source_rules):
+                  encoded = canonical(rule)
+                  if encoded not in rule_lookup:
+                      rule_lookup[encoded] = len(target_driver["rules"])
+                      target_driver["rules"].append(copy.deepcopy(rule))
+                  rule_map[index] = rule_lookup[encoded]
+
+              # Merge artifacts and remap references so findings still point
+              # to the right file when input runs use different artifact indexes.
+              artifact_lookup = {canonical(item): i for i, item in enumerate(target["artifacts"])}
+              artifact_map = {}
+              for index, artifact in enumerate(run.get("artifacts", [])):
+                  encoded = canonical(artifact)
+                  if encoded not in artifact_lookup:
+                      artifact_lookup[encoded] = len(target["artifacts"])
+                      target["artifacts"].append(copy.deepcopy(artifact))
+                  artifact_map[index] = artifact_lookup[encoded]
+
+              for result in run.get("results", []):
+                  result = copy.deepcopy(result)
+                  if isinstance(result.get("ruleIndex"), int):
+                      result["ruleIndex"] = rule_map.get(result["ruleIndex"], result["ruleIndex"])
+
+                  def remap_artifacts(value):
+                      if isinstance(value, dict):
+                          for name, child in list(value.items()):
+                              if name == "artifactIndex" and isinstance(child, int):
+                                  value[name] = artifact_map.get(child, child)
+                              else:
+                                  remap_artifacts(child)
+                      elif isinstance(value, list):
+                          for child in value:
+                              remap_artifacts(child)
+
+                  remap_artifacts(result)
+                  encoded = canonical(result)
+                  if encoded not in target["_result_set"]:
+                      target["_result_set"].add(encoded)
+                      target["results"].append(result)
+
+          output_runs = []
+          for target in merged.values():
+              target.pop("_rule_map", None)
+              target.pop("_artifact_map", None)
+              target.pop("_result_set", None)
+              output_runs.append(target)
+
+          sarif["runs"] = output_runs
+          path.write_text(json.dumps(sarif, separators=(",", ":")) + "\n")
+          PY
+
+      # Upload the normalized SARIF file generated above
       - name: Upload SARIF results file
         uses: github/codeql-action/upload-sarif@v4
         with:
